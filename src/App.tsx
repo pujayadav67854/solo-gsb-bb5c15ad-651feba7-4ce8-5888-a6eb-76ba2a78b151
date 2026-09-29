@@ -34,7 +34,7 @@ import {
 import { buildTrackCsv, parseOcclusions, planTracks } from './lib/occlude';
 import { SAMPLE_A, SAMPLE_B } from './lib/samples';
 import { parseSrt, serializeSrt, type Cue } from './lib/srt';
-import { applyScrollChains, findScrollChains, type ScrollOptions } from './lib/scroll';
+import { applyScrollChains, findScrollChains, pruneScrollAccepted, type ScrollOptions } from './lib/scroll';
 import {
   applySnaps,
   DEFAULT_SNAP_OPTIONS,
@@ -134,7 +134,8 @@ export default function App() {
   });
   const [wrapApplied, setWrapApplied] = useState<ReadonlySet<number>>(new Set());
 
-  // 滚动字幕消重：参数（间隔毫秒 / 最小重叠字）与逐链采纳状态（key 为链 key）
+  // 滚动字幕消重：参数（间隔毫秒 / 最小重叠字）与逐链采纳状态（key 为链内容指纹，
+  // 链成员、原文、时间或重叠结果任一变化都会使旧采纳失效，链回到待采纳）
   const [scrollOpts, setScrollOpts] = useState<ScrollOptions>({
     maxGapMs: 1000,
     minOverlap: 2,
@@ -595,6 +596,14 @@ export default function App() {
     () => (merged ? findScrollChains(merged.cues, scrollOpts) : []),
     [merged, scrollOpts],
   );
+  // 链集合随上游合并结果或参数变化后，立即遗忘已失效的采纳：链成员、原文、时间或
+  // 重叠结果改变会使链得到新内容指纹（旧采纳自然落空），而链一度消失再以相同内容
+  // 出现时，过期采纳也不得自动恢复——须用户重新采纳后才折叠。未变化的其他已采纳
+  // 链 key 不变，继续生效。无失效 key 时 pruneScrollAccepted 返回原集合引用，
+  // setState 以相同引用跳过本次更新，不会触发额外渲染。
+  useEffect(() => {
+    setScrollAccepted((prev) => pruneScrollAccepted(prev, scrollChains));
+  }, [scrollChains]);
   const dedupedCues = useMemo(() => {
     if (!merged) return [];
     return applyScrollChains(merged.cues, scrollChains, scrollAccepted);

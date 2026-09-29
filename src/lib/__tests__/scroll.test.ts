@@ -4,6 +4,7 @@ import {
   applyScrollChains,
   findScrollChains,
   overlapSequence,
+  pruneScrollAccepted,
   suffixPrefixOverlap,
 } from '../scroll';
 
@@ -288,5 +289,131 @@ describe('applyScrollChains', () => {
     const one = cuesOf(['只有一条']);
     expect(findScrollChains(one, OPTS)).toEqual([]);
     expect(applyScrollChains(one, [], new Set())).toEqual(one);
+  });
+});
+
+describe('链 key 内容指纹：采纳只对当时确认的链方案有效', () => {
+  it('相同输入链 key 稳定；成员原文变化产生新 key', () => {
+    const before = findScrollChains(cuesOf(['你好世界', '世界你好']), OPTS);
+    const again = findScrollChains(cuesOf(['你好世界', '世界你好']), OPTS);
+    expect(before[0].key).toBe(again[0].key);
+    const after = findScrollChains(cuesOf(['你好世界', '世界你好吗']), OPTS);
+    expect(after).toHaveLength(1);
+    expect(after[0].key).not.toBe(before[0].key);
+  });
+
+  it('成员时间变化产生新 key', () => {
+    const before = findScrollChains(
+      [cue(0, 2000, '你好世界', 0), cue(2100, 4000, '世界你好', 1)],
+      OPTS,
+    );
+    const after = findScrollChains(
+      [cue(0, 2000, '你好世界', 0), cue(2200, 4000, '世界你好', 1)],
+      OPTS,
+    );
+    expect(after).toHaveLength(1);
+    expect(after[0].key).not.toBe(before[0].key);
+  });
+
+  it('重叠结果（重叠长度与尾部切点）变化产生新 key', () => {
+    const before = findScrollChains(cuesOf(['今天天气很好', '天气很好适合']), OPTS);
+    // 重叠从“天气很好”（4 字）变为“气很好”（3 字），链仍存在但方案已变
+    const after = findScrollChains(cuesOf(['今天天气很好', '气很好适合']), OPTS);
+    expect(before[0].saved).toBe(4);
+    expect(after[0].saved).toBe(3);
+    expect(after[0].key).not.toBe(before[0].key);
+  });
+
+  it('链成员变化产生新 key', () => {
+    const before = findScrollChains(cuesOf(['今天天气很好', '天气很好适合', '很好适合出门']), OPTS);
+    expect(before[0].members).toEqual([0, 1, 2]);
+    // 中间一组文本改动后链断开，只余前两条组成的新链
+    const after = findScrollChains(cuesOf(['今天天气很好', '天气很好适合', '完全无关内容']), OPTS);
+    expect(after).toHaveLength(1);
+    expect(after[0].members).toEqual([0, 1]);
+    expect(after[0].key).not.toBe(before[0].key);
+  });
+
+  it('旧采纳 key 不能折叠变化后的链：输出保留当前未消重字幕，重新采纳后才折叠', () => {
+    const cues1 = cuesOf(['你好世界', '世界你好']);
+    const staleKey = findScrollChains(cues1, OPTS)[0].key;
+    // 改动其中一组文本后，链仍存在（重叠长度与合并文本已变）
+    const cues2 = cuesOf(['你好世界', '世界你好吗']);
+    const chains2 = findScrollChains(cues2, OPTS);
+    expect(chains2).toHaveLength(1);
+    // 旧 key 落空：不折叠，保留未消重的当前字幕
+    expect(applyScrollChains(cues2, chains2, new Set([staleKey]))).toEqual(cues2);
+    // 用户再次采纳新 key 后才折叠
+    const out = applyScrollChains(cues2, chains2, new Set([chains2[0].key]));
+    expect(out).toHaveLength(1);
+    expect(out[0].text).toBe('你好世界你好吗');
+  });
+
+  it('未变化的其他链 key 不变，其采纳继续生效', () => {
+    const mk = (tail: string) => [
+      cue(0, 2000, '你好世界', 0),
+      cue(2050, 4000, tail, 1),
+      cue(4500, 6000, '再见朋友', 2),
+      cue(6050, 8000, '朋友再见', 3),
+    ];
+    const before = findScrollChains(mk('世界你好'), OPTS);
+    expect(before).toHaveLength(2);
+    const after = findScrollChains(mk('世界你好吗'), OPTS);
+    expect(after).toHaveLength(2);
+    expect(after[0].key).not.toBe(before[0].key); // 受影响的链换新 key
+    expect(after[1].key).toBe(before[1].key); // 未受影响的链 key 不变
+    // 旧采纳集合中：第一条链的 key 落空不折叠，第二条链的 key 仍然生效
+    const out = applyScrollChains(
+      mk('世界你好吗'),
+      after,
+      new Set([before[0].key, before[1].key]),
+    );
+    expect(out).toHaveLength(3);
+    expect(out[0]).toMatchObject({ text: '你好世界' });
+    expect(out[1]).toMatchObject({ text: '世界你好吗' });
+    expect(out[2]).toMatchObject({ start: 4500, end: 8000, text: '再见朋友再见' });
+  });
+});
+
+describe('pruneScrollAccepted 遗忘失效采纳', () => {
+  it('移除当前链集合中不存在的 key，保留仍存在的 key', () => {
+    const chains = findScrollChains(cuesOf(['你好世界', '世界你好']), OPTS);
+    const pruned = pruneScrollAccepted(new Set([chains[0].key, 'stale-key']), chains);
+    expect([...pruned]).toEqual([chains[0].key]);
+  });
+
+  it('无失效 key（或集合为空）时返回原集合引用', () => {
+    const chains = findScrollChains(cuesOf(['你好世界', '世界你好']), OPTS);
+    const acc = new Set([chains[0].key]);
+    expect(pruneScrollAccepted(acc, chains)).toBe(acc);
+    const empty = new Set<string>();
+    expect(pruneScrollAccepted(empty, chains)).toBe(empty);
+  });
+
+  it('链内容变化后旧 key 被遗忘；链一度消失再以相同内容出现也不会自动恢复', () => {
+    const cues1 = cuesOf(['你好世界', '世界你好']);
+    const k1 = findScrollChains(cues1, OPTS)[0].key;
+    let accepted: ReadonlySet<string> = new Set([k1]);
+
+    // 场景一：链内容变化（未消失），旧 key 立即被清理
+    const cues2 = cuesOf(['你好世界', '世界你好吗']);
+    const chains2 = findScrollChains(cues2, OPTS);
+    expect(chains2).toHaveLength(1);
+    expect(chains2[0].key).not.toBe(k1);
+    accepted = pruneScrollAccepted(accepted, chains2);
+    expect(accepted.size).toBe(0);
+
+    // 场景二：重新采纳后链一度消失（重叠不足），再以相同内容出现
+    accepted = new Set([chains2[0].key]);
+    const gone = findScrollChains(cuesOf(['你好世界', '完全不同']), OPTS);
+    expect(gone).toHaveLength(0);
+    accepted = pruneScrollAccepted(accepted, gone);
+    expect(accepted.size).toBe(0);
+    // 改回相同内容：链以相同 key 重新出现，但采纳已被遗忘，不自动折叠
+    const cues3 = cuesOf(['你好世界', '世界你好吗']);
+    const chains3 = findScrollChains(cues3, OPTS);
+    expect(chains3[0].key).toBe(chains2[0].key);
+    accepted = pruneScrollAccepted(accepted, chains3);
+    expect(applyScrollChains(cues3, chains3, accepted)).toEqual(cues3);
   });
 });

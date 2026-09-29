@@ -13,6 +13,10 @@
  *   ③ 同分时取更早链（首条下标更小；仍相同依次比较链末与下一条链）。
  * - 合并文本：链首全文 + 后续各项原文在重叠位置之后的“新增尾部”（标点/空白/标签
  *   原样保留，不做标签补全）；时间取链首条开始与末条结束。
+ * - 采纳失效：链 key 是由链成员、各成员原文与起止时间、各边重叠结果共同构成的
+ *   内容指纹，任一维度变化都会得到新 key，旧采纳自然失效、链回到待采纳；
+ *   pruneScrollAccepted 在链集合变化后真正遗忘失效采纳——链一度消失再以相同
+ *   内容出现时，过期采纳不会自动恢复，须用户重新采纳后才折叠。
  */
 import type { MergedCue } from './merge';
 
@@ -35,7 +39,11 @@ export interface ScrollEdge {
 }
 
 export interface ScrollChain {
-  /** 稳定标识：成员 groupIndex 以 '-' 连接 */
+  /**
+   * 内容指纹标识：由链成员 groupIndex、各成员起止时间与原文、各边重叠结果
+   * （重叠字数与新增尾部切点）共同构成；任一维度变化都会得到不同 key，
+   * 针对旧方案的采纳随之失效。仅对完全相同的链方案保持稳定。
+   */
   key: string;
   /** 成员 cue 下标（连续升序） */
   members: number[];
@@ -149,6 +157,25 @@ function edgeBetween(i: number, seqs: VisibleSeq[], cues: MergedCue[], opts: Scr
   return { a: i, b: i + 1, overlap, tailStart };
 }
 
+/**
+ * 链的内容指纹：成员 groupIndex、各成员起止时间与原文、各边重叠结果（重叠字数与
+ * 新增尾部切点）共同构成。任一维度变化（如改动某组的文本选择后重叠长度与合并文本
+ * 改变）都会得到不同 key，使旧采纳自然失效。用 JSON 序列化避免原文中出现分隔符
+ * 造成的拼接歧义。
+ */
+function chainKey(
+  members: number[],
+  edges: ScrollChain['edges'],
+  cues: MergedCue[],
+): string {
+  return JSON.stringify([
+    members.map((m) => cues[m].groupIndex),
+    members.map((m) => [cues[m].start, cues[m].end]),
+    members.map((m) => cues[m].text),
+    edges.map((e) => [e.overlap, e.tailStart]),
+  ]);
+}
+
 function buildChain(
   a: number,
   b: number,
@@ -167,7 +194,7 @@ function buildChain(
     chainEdges.push({ overlap: e.overlap, tailStart: e.tailStart });
   }
   return {
-    key: members.map((m) => cues[m].groupIndex).join('-'),
+    key: chainKey(members, chainEdges, cues),
     members,
     start: cues[a].start,
     end: cues[b].end,
@@ -294,4 +321,27 @@ export function applyScrollChains(
     }
   }
   return out;
+}
+
+/**
+ * 遗忘已失效的采纳：只保留仍存在于当前链集合中的 key，返回清理后的集合
+ * （无变化时返回原集合引用，便于调用方跳过状态更新）。
+ *
+ * 链因参数或上游合并结果变化而一度消失后，即使再以完全相同的内容（相同 key）
+ * 出现，过期采纳也不得自动恢复——必须在消失时就真正遗忘，而不是仅在应用时
+ * 临时忽略；仍存在于当前链集合中的其他已采纳链不受影响。
+ */
+export function pruneScrollAccepted(
+  accepted: ReadonlySet<string>,
+  chains: readonly ScrollChain[],
+): ReadonlySet<string> {
+  if (accepted.size === 0) return accepted;
+  const live = new Set(chains.map((c) => c.key));
+  let changed = false;
+  const next = new Set<string>();
+  accepted.forEach((k) => {
+    if (live.has(k)) next.add(k);
+    else changed = true;
+  });
+  return changed ? next : accepted;
 }
