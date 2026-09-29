@@ -4,6 +4,7 @@ import {
   applyScrollChains,
   findScrollChains,
   overlapSequence,
+  pruneScrollAcceptance,
   suffixPrefixOverlap,
 } from '../scroll';
 
@@ -22,6 +23,12 @@ function cuesOf(texts: string[], gap = 100, dur = 2000): MergedCue[] {
     const start = i * (dur + gap);
     return cue(start, start + dur, t, i);
   });
+}
+
+/** 按链当前方案（key + 指纹）构造采纳记录。 */
+function acceptOf(chains: { key: string; signature: string }[], keys?: string[]) {
+  const want = new Set(keys ?? chains.map((c) => c.key));
+  return new Map(chains.filter((c) => want.has(c.key)).map((c) => [c.key, c.signature]));
 }
 
 const OPTS = { maxGapMs: 1000, minOverlap: 2 };
@@ -240,7 +247,7 @@ describe('applyScrollChains', () => {
     const cues = cuesOf(['你好世界', '世界你好', '你好再见']);
     const chains = findScrollChains(cues, OPTS);
     expect(chains).toHaveLength(1);
-    const out = applyScrollChains(cues, chains, new Set([chains[0].key]));
+    const out = applyScrollChains(cues, chains, acceptOf(chains));
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({
       start: 0,
@@ -253,7 +260,7 @@ describe('applyScrollChains', () => {
   it('未采纳时原样保留全部 cue', () => {
     const cues = cuesOf(['你好世界', '世界你好']);
     const chains = findScrollChains(cues, OPTS);
-    const out = applyScrollChains(cues, chains, new Set());
+    const out = applyScrollChains(cues, chains, new Map());
     expect(out).toEqual(cues);
   });
 
@@ -266,7 +273,7 @@ describe('applyScrollChains', () => {
     ];
     const chains = findScrollChains(c, { maxGapMs: 50, minOverlap: 2 });
     expect(chains).toHaveLength(2);
-    const out = applyScrollChains(c, chains, new Set([chains[1].key]));
+    const out = applyScrollChains(c, chains, acceptOf(chains, [chains[1].key]));
     expect(out).toHaveLength(3);
     expect(out[0]).toBe(c[0]);
     expect(out[1]).toBe(c[1]);
@@ -276,10 +283,17 @@ describe('applyScrollChains', () => {
   it('已失效（当前参数下不存在）的 key 被忽略', () => {
     const cues = cuesOf(['你好世界', '世界你好']);
     const chains = findScrollChains(cues, OPTS);
-    const out = applyScrollChains(cues, chains, new Set(['stale-key']));
+    const out = applyScrollChains(cues, chains, new Map([['stale-key', 'sig']]));
     expect(out).toEqual(cues);
-    // 真实 key 仍可工作
-    const out2 = applyScrollChains(cues, chains, new Set(['stale-key', chains[0].key]));
+    // 真实 key 且指纹一致时仍可工作
+    const out2 = applyScrollChains(
+      cues,
+      chains,
+      new Map([
+        ['stale-key', 'sig'],
+        [chains[0].key, chains[0].signature],
+      ]),
+    );
     expect(out2).toHaveLength(1);
   });
 
@@ -287,6 +301,180 @@ describe('applyScrollChains', () => {
     expect(findScrollChains([], OPTS)).toEqual([]);
     const one = cuesOf(['只有一条']);
     expect(findScrollChains(one, OPTS)).toEqual([]);
-    expect(applyScrollChains(one, [], new Set())).toEqual(one);
+    expect(applyScrollChains(one, [], new Map())).toEqual(one);
+  });
+});
+
+describe('采纳与链方案指纹绑定', () => {
+  it('key 只由成员组序号构成；原文变化后 key 不变但 signature 改变', () => {
+    const cues1 = cuesOf(['你好世界', '世界再见']);
+    const ch1 = findScrollChains(cues1, OPTS)[0];
+    // 人工改选第二组文本：组序号不变（key 相同），原文与合并文本变化（指纹不同）
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], text: '世界明天见' };
+    const ch2 = findScrollChains(cues2, OPTS)[0];
+    expect(ch2.key).toBe(ch1.key);
+    expect(ch2.signature).not.toBe(ch1.signature);
+    expect(ch2.text).not.toBe(ch1.text);
+  });
+
+  it('重叠结果变化（改选文本导致 overlap 改变）使指纹改变', () => {
+    const cues1 = cuesOf(['你好世界', '世界再见']);
+    const ch1 = findScrollChains(cues1, OPTS)[0];
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], text: '世界你好' }; // 重叠仍是“世界”，但合并文本变
+    const ch2 = findScrollChains(cues2, OPTS)[0];
+    expect(ch2.key).toBe(ch1.key);
+    expect(ch2.signature).not.toBe(ch1.signature);
+    // 改首条使重叠长度本身变化：新首条末尾包含整条第二文本，重叠 4 字
+    const cues3 = cues1.map((c) => ({ ...c }));
+    cues3[0] = { ...cues3[0], text: '你好世界再见' };
+    const ch3 = findScrollChains(cues3, OPTS)[0];
+    expect(ch3.key).toBe(ch1.key);
+    expect(ch3.saved).not.toBe(ch1.saved);
+    expect(ch3.signature).not.toBe(ch1.signature);
+  });
+
+  it('成员时间变化（文本不变）也使指纹改变', () => {
+    const cues1 = cuesOf(['你好世界', '世界再见']);
+    const ch1 = findScrollChains(cues1, OPTS)[0];
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], start: 3000, end: 5000 };
+    const ch2 = findScrollChains(cues2, OPTS)[0];
+    expect(ch2.key).toBe(ch1.key);
+    expect(ch2.signature).not.toBe(ch1.signature);
+  });
+
+  it('旧采纳指纹与当前链不符时不折叠：预览/导出保留未消重字幕', () => {
+    const cues1 = cuesOf(['你好世界', '世界再见']);
+    const ch1 = findScrollChains(cues1, OPTS)[0];
+    // 采纳第一版链方案
+    const accepted = acceptOf([ch1]);
+    // 改选第二组文本，链仍在但方案已变
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], text: '世界明天见' };
+    const chains2 = findScrollChains(cues2, OPTS);
+    expect(chains2).toHaveLength(1);
+    // 旧采纳只凭相同 key 不得折叠新文本
+    const out = applyScrollChains(cues2, chains2, accepted);
+    expect(out).toEqual(cues2);
+  });
+
+  it('指纹不符的同 key 采纳在其他链已采纳时仍被隔离，未变化的链继续折叠', () => {
+    const c = [
+      cue(0, 2000, '你好世界', 0),
+      cue(2050, 4000, '世界你好', 1),
+      cue(4500, 6000, '再见朋友', 2),
+      cue(6050, 8000, '朋友再见', 3),
+    ];
+    const opts = { maxGapMs: 50, minOverlap: 2 };
+    const chains = findScrollChains(c, opts);
+    expect(chains).toHaveLength(2);
+    // 两条链都采纳
+    const accepted = acceptOf(chains);
+    // 仅改第一条链成员的文本（第二组改选），第二条链内容不变
+    const c2 = c.map((x) => ({ ...x }));
+    c2[1] = { ...c2[1], text: '世界明天' };
+    const chains2 = findScrollChains(c2, opts);
+    expect(chains2).toHaveLength(2);
+    const out = applyScrollChains(c2, chains2, accepted);
+    // 第一条链保持未折叠的两条原文，第二条链继续折叠
+    expect(out).toHaveLength(3);
+    expect(out[0]).toEqual(c2[0]);
+    expect(out[1]).toEqual(c2[1]);
+    expect(out[2]).toMatchObject({ start: 4500, end: 8000, groupIndex: 2 });
+  });
+
+  it('重新采纳变化后的链才按新方案折叠', () => {
+    const cues1 = cuesOf(['你好世界', '世界再见']);
+    const accepted = acceptOf(findScrollChains(cues1, OPTS));
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], text: '世界明天见' };
+    const chains2 = findScrollChains(cues2, OPTS);
+    // 旧采纳仍在时，指纹不符不会折叠
+    expect(applyScrollChains(cues2, chains2, accepted)).toEqual(cues2);
+    // 用户再次采纳当前方案后才折叠
+    const reaccepted = acceptOf(chains2);
+    const out = applyScrollChains(cues2, chains2, reaccepted);
+    expect(out).toHaveLength(1);
+    expect(out[0].text).toBe('你好世界明天见');
+  });
+});
+
+describe('pruneScrollAcceptance 失效清除（含墓碑语义）', () => {
+  it('未变化的已采纳链保留', () => {
+    const cues = cuesOf(['你好世界', '世界你好']);
+    const chains = findScrollChains(cues, OPTS);
+    const accepted = acceptOf(chains);
+    const { next, changed } = pruneScrollAcceptance(chains, accepted);
+    expect(changed).toBe(false);
+    expect(next).toEqual(accepted);
+  });
+
+  it('指纹变化（原文/时间/重叠结果改变）的采纳被删除', () => {
+    const cues1 = cuesOf(['你好世界', '世界再见']);
+    const ch1 = findScrollChains(cues1, OPTS)[0];
+    const accepted = acceptOf([ch1]);
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], text: '世界明天见' };
+    const chains2 = findScrollChains(cues2, OPTS);
+    const { next, changed } = pruneScrollAcceptance(chains2, accepted);
+    expect(changed).toBe(true);
+    expect(next.has(ch1.key)).toBe(false);
+  });
+
+  it('链在当前方案中消失时删除采纳（回到待采纳）', () => {
+    const cues1 = cuesOf(['你好世界', '世界你好']);
+    const ch1 = findScrollChains(cues1, OPTS)[0];
+    const accepted = acceptOf([ch1]);
+    // 放宽间隔场景改为使链消失：第二文本改成无重叠（同组序号 key 不变）
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], text: '完全不同内容' };
+    const chains2 = findScrollChains(cues2, OPTS);
+    expect(chains2).toHaveLength(0);
+    const { next, changed } = pruneScrollAcceptance(chains2, accepted);
+    expect(changed).toBe(true);
+    expect(next.size).toBe(0);
+  });
+
+  it('旧链消失后又以相同内容出现：清除是物理删除，过期采纳不自动恢复', () => {
+    const cues1 = cuesOf(['你好世界', '世界你好']);
+    const ch1 = findScrollChains(cues1, OPTS)[0];
+    const accepted1 = acceptOf([ch1]);
+
+    // 第一步：链消失（文本改到无重叠），采纳被物理清除
+    const cues2 = cues1.map((c) => ({ ...c }));
+    cues2[1] = { ...cues2[1], text: '完全不同内容' };
+    const chainsGone = findScrollChains(cues2, OPTS);
+    expect(chainsGone).toHaveLength(0);
+    const pruned = pruneScrollAcceptance(chainsGone, accepted1).next;
+    expect(pruned.size).toBe(0);
+
+    // 第二步：以与当初完全相同的内容再次出现（指纹与旧采纳一致），
+    // 因记录已被删除，不会自动恢复，必须重新采纳
+    const chainsBack = findScrollChains(cues1, OPTS);
+    const { next, changed } = pruneScrollAcceptance(chainsBack, pruned);
+    expect(changed).toBe(false);
+    expect(next.size).toBe(0);
+    expect(applyScrollChains(cues1, chainsBack, next)).toEqual(cues1);
+  });
+
+  it('多条链中仅变化者失效，其他已采纳链不受影响', () => {
+    const c = [
+      cue(0, 2000, '你好世界', 0),
+      cue(2050, 4000, '世界你好', 1),
+      cue(4500, 6000, '再见朋友', 2),
+      cue(6050, 8000, '朋友再见', 3),
+    ];
+    const opts = { maxGapMs: 50, minOverlap: 2 };
+    const chains = findScrollChains(c, opts);
+    const accepted = acceptOf(chains);
+    const c2 = c.map((x) => ({ ...x }));
+    c2[0] = { ...c2[0], text: '明天世界' }; // 第一链文本变化
+    const chains2 = findScrollChains(c2, opts);
+    const { next, changed } = pruneScrollAcceptance(chains2, accepted);
+    expect(changed).toBe(true);
+    expect(next.size).toBe(1);
+    expect(next.has(chains[1].key)).toBe(true);
   });
 });

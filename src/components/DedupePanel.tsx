@@ -1,7 +1,12 @@
 import { useMemo, useState } from 'react';
 import type { MergedCue } from '../lib/merge';
 import { formatTimecode } from '../lib/srt';
-import { findScrollChains, type ScrollChain, type ScrollOptions } from '../lib/scroll';
+import {
+  findScrollChains,
+  type ScrollAcceptance,
+  type ScrollChain,
+  type ScrollOptions,
+} from '../lib/scroll';
 
 const PAGE = 50;
 
@@ -10,8 +15,8 @@ interface DedupePanelProps {
   cues: MergedCue[];
   options: ScrollOptions;
   onOptions(next: ScrollOptions): void;
-  /** 已采纳链的 key 集合 */
-  accepted: ReadonlySet<string>;
+  /** 已采纳链：key（成员组序号）→ 采纳当时的链方案指纹 */
+  accepted: ScrollAcceptance;
   onAccept(key: string): void;
   onRestore(key: string): void;
   onAcceptAll(keys: string[]): void;
@@ -27,11 +32,13 @@ export function DedupePanel(props: DedupePanelProps) {
   const chains = useMemo(() => findScrollChains(cues, options), [cues, options]);
   const chainByKey = useMemo(() => new Map(chains.map((c) => [c.key, c])), [chains]);
 
-  // 已采纳集合可能引用旧参数下的链；统计与全部采纳都以当前链为准
+  // 采纳只对采纳当时的链方案有效：key 仍在且指纹完全一致才算已采纳。
+  // key 只编码成员组序号，文本/时间/重叠改变后 key 不变、指纹变化，回到待采纳。
   const liveAccepted = useMemo(() => {
     const s = new Set<string>();
-    accepted.forEach((k) => {
-      if (chainByKey.has(k)) s.add(k);
+    accepted.forEach((sig, k) => {
+      const ch = chainByKey.get(k);
+      if (ch && ch.signature === sig) s.add(k);
     });
     return s;
   }, [accepted, chainByKey]);
@@ -98,6 +105,9 @@ export function DedupePanel(props: DedupePanelProps) {
         {chains.length > 0 && <em> · 全部采纳共可节省 {totalSaved} 个重复字符</em>}
         <span className="wrap-hint">
           按去标签/标点/空白后的字符序列计算相邻最长后缀-前缀重叠，全局动态规划选择互不重叠链
+        </span>
+        <span className="wrap-hint">
+          采纳只对当时确认的链方案生效：采纳后再改动成员组的文本选择、时间或消重参数，导致链成员、原文、时间或重叠结果变化时，该链自动回到「待采纳」，预览与导出恢复保留未消重字幕，需重新采纳才折叠；链一度消失后再以相同内容出现也不会自动恢复采纳，其他未变化的已采纳链继续生效
         </span>
       </div>
 

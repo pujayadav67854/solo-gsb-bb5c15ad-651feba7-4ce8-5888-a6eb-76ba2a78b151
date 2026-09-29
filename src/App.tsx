@@ -34,7 +34,13 @@ import {
 import { buildTrackCsv, parseOcclusions, planTracks } from './lib/occlude';
 import { SAMPLE_A, SAMPLE_B } from './lib/samples';
 import { parseSrt, serializeSrt, type Cue } from './lib/srt';
-import { applyScrollChains, findScrollChains, type ScrollOptions } from './lib/scroll';
+import {
+  applyScrollChains,
+  findScrollChains,
+  pruneScrollAcceptance,
+  type ScrollAcceptance,
+  type ScrollOptions,
+} from './lib/scroll';
 import {
   applySnaps,
   DEFAULT_SNAP_OPTIONS,
@@ -134,12 +140,14 @@ export default function App() {
   });
   const [wrapApplied, setWrapApplied] = useState<ReadonlySet<number>>(new Set());
 
-  // 滚动字幕消重：参数（间隔毫秒 / 最小重叠字）与逐链采纳状态（key 为链 key）
+  // 滚动字幕消重：参数（间隔毫秒 / 最小重叠字）与逐链采纳状态。
+  // 采纳记录为“链 key（成员组序号）→ 采纳当时的链方案指纹”：只对确认时的
+  // 链方案有效；原文/时间/重叠结果变化或链消失即清除（链重现也不自动恢复）。
   const [scrollOpts, setScrollOpts] = useState<ScrollOptions>({
     maxGapMs: 1000,
     minOverlap: 2,
   });
-  const [scrollAccepted, setScrollAccepted] = useState<ReadonlySet<string>>(new Set());
+  const [scrollAccepted, setScrollAccepted] = useState<ScrollAcceptance>(new Map());
 
   // 阅读节奏：参数（最大字符/秒、最短/最长时长）与逐区段采纳状态（key 为区段 key）
   const [paceOpts, setPaceOpts] = useState<PaceOptions>(DEFAULT_PACE_OPTIONS);
@@ -222,7 +230,7 @@ export default function App() {
           setAutoFix(false);
           setView('groups');
           setWrapApplied(new Set());
-          setScrollAccepted(new Set());
+          setScrollAccepted(new Map());
           setPaceAccepted(new Set());
           setSnapAccepted(new Set());
           setPhase('workspace');
@@ -378,7 +386,7 @@ export default function App() {
     setAutoFix(false);
     setView('groups');
     setWrapApplied(new Set());
-    setScrollAccepted(new Set());
+    setScrollAccepted(new Map());
     setPaceAccepted(new Set());
     setSnapAccepted(new Set());
     setMigrateOpen(false);
@@ -479,7 +487,7 @@ export default function App() {
     setCalibForced(new Set());
     setView('groups');
     setWrapApplied(new Set());
-    setScrollAccepted(new Set());
+    setScrollAccepted(new Map());
     setPaceAccepted(new Set());
     setSnapAccepted(new Set());
     setMigrateMode(false);
@@ -503,7 +511,7 @@ export default function App() {
     setCalibForced(new Set());
     setView('groups');
     setWrapApplied(new Set());
-    setScrollAccepted(new Set());
+    setScrollAccepted(new Map());
     setPaceAccepted(new Set());
     setSnapAccepted(new Set());
     setMigrateMode(false);
@@ -590,13 +598,25 @@ export default function App() {
     [groups, states, cuesA, cuesBEff],
   );
 
-  // 滚动字幕消重：在合并结果上识别滚动链，按已采纳链折叠后再进入断行/导出
+  // 滚动字幕消重：在合并结果上识别滚动链，按已采纳链折叠后再进入断行/导出。
+  // 采纳记录为“链 key（成员组序号）→ 采纳当时的链方案指纹”：链随上游/参数重算后，
+  // 指纹变化或已消失的采纳被物理清除（链之后以相同内容重现也不恢复），
+  // 未变化的其他采纳继续生效。
   const scrollChains = useMemo(
     () => (merged ? findScrollChains(merged.cues, scrollOpts) : []),
     [merged, scrollOpts],
   );
+  useEffect(() => {
+    setScrollAccepted((prev) => {
+      if (prev.size === 0) return prev;
+      const { next, changed } = pruneScrollAcceptance(scrollChains, prev);
+      return changed ? next : prev;
+    });
+  }, [scrollChains]);
   const dedupedCues = useMemo(() => {
     if (!merged) return [];
+    // applyScrollChains 同时比对 key 与指纹；清除 effect 尚未提交的瞬间也不会
+    // 误折叠任何已变化的链（预览/导出始终只折叠“已确认方案”）。
     return applyScrollChains(merged.cues, scrollChains, scrollAccepted);
   }, [merged, scrollChains, scrollAccepted]);
   const dedupStats = useMemo(() => {
@@ -605,7 +625,7 @@ export default function App() {
     let totalSaved = 0;
     for (const ch of scrollChains) {
       totalSaved += ch.saved;
-      if (scrollAccepted.has(ch.key)) {
+      if (scrollAccepted.get(ch.key) === ch.signature) {
         appliedChains++;
         saved += ch.saved;
       }
@@ -613,21 +633,28 @@ export default function App() {
     return { chainCount: scrollChains.length, appliedChains, saved, totalSaved };
   }, [scrollChains, scrollAccepted]);
 
-  const acceptChain = (key: string) =>
-    setScrollAccepted((prev) => new Set(prev).add(key));
+  const acceptChain = (key: string) => {
+    const ch = scrollChains.find((c) => c.key === key);
+    if (!ch) return;
+    setScrollAccepted((prev) => new Map(prev).set(key, ch.signature));
+  };
   const restoreChain = (key: string) =>
     setScrollAccepted((prev) => {
-      const next = new Set(prev);
+      if (!prev.has(key)) return prev;
+      const next = new Map(prev);
       next.delete(key);
       return next;
     });
   const acceptAllChains = (keys: string[]) =>
     setScrollAccepted((prev) => {
-      const next = new Set(prev);
-      keys.forEach((k) => next.add(k));
+      const next = new Map(prev);
+      keys.forEach((k) => {
+        const ch = scrollChains.find((c) => c.key === k);
+        if (ch) next.set(k, ch.signature);
+      });
       return next;
     });
-  const restoreAllChains = () => setScrollAccepted(new Set());
+  const restoreAllChains = () => setScrollAccepted(new Map());
 
   // 智能断行：对每条（消重后）结果按当前参数试算；已应用且可满足限制的条目使用断行文本
   const wrapResults = useMemo(

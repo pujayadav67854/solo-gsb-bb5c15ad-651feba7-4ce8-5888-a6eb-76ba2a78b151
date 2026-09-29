@@ -15,7 +15,11 @@ describe('全链路集成：对齐 → 合并 → 消重 → 断行 → 阅读�
     const states = groups.map((g) => defaultStateFor(g, cuesA, cuesB));
     const merged = buildMergedCues(groups, states, cuesA, cuesB);
     const chains = findScrollChains(merged.cues, { maxGapMs: 1000, minOverlap: 2 });
-    const deduped = applyScrollChains(merged.cues, chains, new Set(chains.map((c) => c.key)));
+    const deduped = applyScrollChains(
+      merged.cues,
+      chains,
+      new Map(chains.map((c) => [c.key, c.signature])),
+    );
     const wrapped = deduped.map((c) => {
       const r = smartWrap(c.text, { maxWidth: 42, maxLines: 2, lockManualBreaks: true });
       return r.ok ? { ...c, text: r.text } : c;

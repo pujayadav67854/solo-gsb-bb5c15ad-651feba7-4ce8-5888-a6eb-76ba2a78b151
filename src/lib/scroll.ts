@@ -13,6 +13,12 @@
  *   ③ 同分时取更早链（首条下标更小；仍相同依次比较链末与下一条链）。
  * - 合并文本：链首全文 + 后续各项原文在重叠位置之后的“新增尾部”（标点/空白/标签
  *   原样保留，不做标签补全）；时间取链首条开始与末条结束。
+ * - 采纳：链的身份 key 只由成员 groupIndex 构成，另以 signature 固化采纳当时的
+ *   完整链方案（成员原文、时间、各边重叠结果与合并文本）。采纳仅对当时确认的
+ *   方案有效；链成员、原文、时间或重叠结果改变后 key 不变但指纹改变，该链回到
+ *   待采纳、预览与导出保留未消重原文，需再次采纳才折叠。链一旦在当前方案中消失，
+ *   其采纳被物理清除，之后即便以相同内容重现也不会自动恢复；未变化的其他已采纳
+ *   链继续生效。
  */
 import type { MergedCue } from './merge';
 
@@ -35,8 +41,17 @@ export interface ScrollEdge {
 }
 
 export interface ScrollChain {
-  /** 稳定标识：成员 groupIndex 以 '-' 连接 */
+  /**
+   * 稳定身份标识：成员 groupIndex 以 '-' 连接。只表示“这一组组成的链”，
+   * 不随原文、时间、参数或重叠结果变化——同一组文本改选后 key 保持不变。
+   */
   key: string;
+  /**
+   * 当前链方案指纹：成员（groupIndex + 开始/结束时间 + 原文）与各边重叠结果、
+   * 合并文本共同编码。采纳只对采纳当时的指纹有效；任一构成项变化后指纹即变，
+   * 旧采纳回到待采纳，不再参与折叠，需再次采纳。
+   */
+  signature: string;
   /** 成员 cue 下标（连续升序） */
   members: number[];
   /** 链首条开始时间（毫秒） */
@@ -149,6 +164,29 @@ function edgeBetween(i: number, seqs: VisibleSeq[], cues: MergedCue[], opts: Scr
   return { a: i, b: i + 1, overlap, tailStart };
 }
 
+/**
+ * 计算链方案指纹：完整描述“采纳当时确认的方案”。任何成员的 groupIndex、
+ * 开始/结束时间、原文，或任一相邻边的重叠结果（overlap / tailStart）、
+ * 累计节省字数与合并文本不同，指纹都不同。指纹不追求哈希防碰撞，用可读的
+ * 分隔编码（各字段不会出现 '␟'）即可保证不同方案不同串。
+ */
+export function scrollChainSignature(
+  cues: MergedCue[],
+  members: number[],
+  edges: ScrollChain['edges'],
+  text: string,
+  saved: number,
+): string {
+  const m = members
+    .map((i) => {
+      const c = cues[i];
+      return [c.groupIndex, c.start, c.end, c.text].join('␟');
+    })
+    .join('␞');
+  const e = edges.map((x) => `${x.overlap}:${x.tailStart}`).join(',');
+  return [m, e, saved, text].join('␝');
+}
+
 function buildChain(
   a: number,
   b: number,
@@ -168,6 +206,7 @@ function buildChain(
   }
   return {
     key: members.map((m) => cues[m].groupIndex).join('-'),
+    signature: scrollChainSignature(cues, members, chainEdges, text, saved),
     members,
     start: cues[a].start,
     end: cues[b].end,
@@ -269,19 +308,50 @@ export function findScrollChains(cues: MergedCue[], options: ScrollOptions): Scr
 /* ---------------- 采纳与输出 ---------------- */
 
 /**
- * 按已采纳链（key 集合）折叠合并结果：命中的连续区间替换为一条合并 cue，
- * groupIndex 取链首条；未采纳的 cue 原样保留。已失效（不在 chains 中）的
- * key 会被忽略。
+ * 采纳记录：链身份 key → 采纳当时的链方案指纹（ScrollChain.signature）。
+ */
+export type ScrollAcceptance = ReadonlyMap<string, string>;
+
+/**
+ * 依据当前链集合清理采纳记录，返回仍然有效的子集；记录发生删除时 changed 为 true。
+ *
+ * 一条采纳继续成立，当且仅当当前链中存在**相同 key 且相同指纹**的链：
+ * - 指纹不同（链成员原文、时间或重叠/合并结果改变）：采纳回到待采纳，记录删除；
+ * - key 已不存在（链在当前方案下消失）：记录同样删除。
+ *
+ * 删除是物理删除而非暂时忽略：因此链一度消失、之后又以**相同内容**出现时，
+ * 旧采纳也不会自动恢复，必须重新采纳。其他未变化的已采纳链不受影响。
+ */
+export function pruneScrollAcceptance(
+  chains: readonly ScrollChain[],
+  accepted: ScrollAcceptance,
+): { next: Map<string, string>; changed: boolean } {
+  const live = new Map(chains.map((c) => [c.key, c.signature]));
+  const next = new Map<string, string>();
+  let changed = false;
+  accepted.forEach((sig, key) => {
+    if (live.has(key) && live.get(key) === sig) next.set(key, sig);
+    else changed = true;
+  });
+  return { next, changed };
+}
+
+/**
+ * 按已采纳链折叠合并结果：只有 key 存在于当前链、且采纳指纹与当前链指纹
+ * 完全一致的采纳才生效，命中的连续区间替换为一条合并 cue，groupIndex 取链
+ * 首条；未采纳（含指纹不符、key 已失效）的 cue 原样保留。
  */
 export function applyScrollChains(
   cues: MergedCue[],
   chains: ScrollChain[],
-  accepted: ReadonlySet<string>,
+  accepted: ScrollAcceptance,
 ): MergedCue[] {
+  if (accepted.size === 0) return cues;
   const byStart = new Map<number, ScrollChain>();
   for (const ch of chains) {
-    if (accepted.has(ch.key)) byStart.set(ch.members[0], ch);
+    if (accepted.get(ch.key) === ch.signature) byStart.set(ch.members[0], ch);
   }
+  if (byStart.size === 0) return cues;
   const out: MergedCue[] = [];
   for (let i = 0; i < cues.length; ) {
     const ch = byStart.get(i);
